@@ -1,56 +1,16 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, writeDb, findRubbing, findUnfinishedScanBatch, migrateLegacyData } = require("./lib/db");
+const { now, required, httpError } = require("./lib/util");
+const scanBatches = require("./modules/scanBatches");
+const accessControl = require("./modules/access");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  rubbings: [
-    {
-      id: "rubbing_demo",
-      code: "TP-清-014",
-      source: "地方碑刻残页",
-      paperSize: "42x68cm",
-      note: "边缘有旧折痕",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  damages: [
-    {
-      id: "damage_demo_1",
-      rubbingId: "rubbing_demo",
-      position: "左上角第3列题字旁",
-      type: "虫蛀孔",
-      beforePhotoUrl: "https://example.local/before-014-1.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    },
-    {
-      id: "damage_demo_2",
-      rubbingId: "rubbing_demo",
-      position: "下边缘中央",
-      type: "撕裂",
-      beforePhotoUrl: "https://example.local/before-014-2.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    }
-  ],
-  batches: []
-};
 
 const routes = [
   "GET /health",
   "GET /rubbings",
   "POST /rubbings",
+  "PATCH /rubbings/:id",
   "GET /rubbings/:id/damages",
   "POST /rubbings/:id/damages",
   "GET /damages?status=&type=",
@@ -58,26 +18,15 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  "GET /scan-batches?rubbingId=",
+  "POST /rubbings/:id/scan-batches",
+  "GET /scan-batches/:id",
+  "POST /scan-batches/:id/verify",
+  "POST /scan-batches/:id/rescan",
+  "POST /accesses",
+  "GET /accesses?rubbingId=&scanBatchId="
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -91,33 +40,12 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw httpError(400, "请求体必须是合法JSON");
   }
 }
 
 function makeId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function required(body, fields) {
-  const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
-  if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
-  }
-}
-
-function findRubbing(db, rubbingId) {
-  const rubbing = db.rubbings.find((item) => item.id === rubbingId);
-  if (!rubbing) {
-    const error = new Error("拓片不存在");
-    error.status = 404;
-    throw error;
-  }
-  return rubbing;
 }
 
 function enrichBatch(db, batch) {
@@ -143,10 +71,14 @@ async function handle(req, res) {
   if (req.method === "GET" && pathname === "/rubbings") {
     const data = db.rubbings.map((rubbing) => {
       const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
+      const unfinishedScan = findUnfinishedScanBatch(db, rubbing.id);
       return {
         ...rubbing,
         damageCount: damages.length,
-        pendingDamages: damages.filter((item) => item.status !== "repaired").length
+        pendingDamages: damages.filter((item) => item.status !== "repaired").length,
+        scanReady: rubbing.projectStatus === "closed" && rubbing.materialsComplete === true,
+        unfinishedScanBatchId: unfinishedScan ? unfinishedScan.id : null,
+        scanStatus: unfinishedScan ? unfinishedScan.status : null
       };
     });
     return send(res, 200, { data });
@@ -161,11 +93,32 @@ async function handle(req, res) {
       source: body.source,
       paperSize: body.paperSize,
       note: body.note || "",
-      createdAt: new Date().toISOString()
+      projectStatus: body.projectStatus || "open",
+      materialsComplete: body.materialsComplete === true,
+      createdAt: now()
     };
     db.rubbings.push(rubbing);
     await writeDb(db);
-    return send(res, 201, { data: rubbing });
+    const created = findRubbing(db, rubbing.id);
+    return send(res, 201, { data: created });
+  }
+
+  const rubbingMatch = pathname.match(/^\/rubbings\/([^/]+)$/);
+  if (rubbingMatch && req.method === "PATCH") {
+    const rubbing = findRubbing(db, rubbingMatch[1]);
+    const body = await parseBody(req);
+    if (body.projectStatus !== undefined) {
+      if (!["open", "closed"].includes(body.projectStatus)) {
+        throw httpError(400, "projectStatus 仅支持 open / closed");
+      }
+      rubbing.projectStatus = body.projectStatus;
+    }
+    if (body.materialsComplete !== undefined) {
+      rubbing.materialsComplete = body.materialsComplete === true;
+    }
+    if (body.note !== undefined) rubbing.note = body.note;
+    await writeDb(db); // 归档状态随结项/资料齐全自动重算并写回数据文件
+    return send(res, 200, { data: findRubbing(db, rubbing.id) });
   }
 
   const rubbingDamagesMatch = pathname.match(/^\/rubbings\/([^/]+)\/damages$/);
@@ -190,12 +143,22 @@ async function handle(req, res) {
       status: "pending",
       repairNote: "",
       batchId: null,
-      createdAt: new Date().toISOString(),
+      createdAt: now(),
       repairedAt: null
     };
     db.damages.push(damage);
     await writeDb(db);
     return send(res, 201, { data: damage });
+  }
+
+  // 数字化送扫：POST /rubbings/:id/scan-batches
+  const rubbingScanMatch = pathname.match(/^\/rubbings\/([^/]+)\/scan-batches$/);
+  if (rubbingScanMatch && req.method === "POST") {
+    const rubbing = findRubbing(db, rubbingScanMatch[1]);
+    const body = await parseBody(req);
+    const batch = scanBatches.createBatch(db, rubbing, body);
+    await writeDb(db);
+    return send(res, 201, { data: scanBatches.serialize(db, batch) });
   }
 
   if (req.method === "GET" && pathname === "/damages") {
@@ -218,7 +181,7 @@ async function handle(req, res) {
       status: body.status ?? damage.status,
       repairNote: body.repairNote ?? damage.repairNote
     });
-    damage.repairedAt = damage.status === "repaired" ? new Date().toISOString() : damage.repairedAt;
+    damage.repairedAt = damage.status === "repaired" ? now() : damage.repairedAt;
     await writeDb(db);
     return send(res, 200, { data: damage });
   }
@@ -239,7 +202,7 @@ async function handle(req, res) {
       status: "open",
       damageIds: body.damageIds,
       note: body.note || "",
-      createdAt: new Date().toISOString(),
+      createdAt: now(),
       completedAt: null
     };
     db.batches.push(batch);
@@ -267,7 +230,7 @@ async function handle(req, res) {
     const body = await parseBody(req);
     const results = Array.isArray(body.results) ? body.results : [];
     batch.status = "completed";
-    batch.completedAt = new Date().toISOString();
+    batch.completedAt = now();
     batch.note = body.note ?? batch.note;
     db.damages.forEach((damage) => {
       if (!batch.damageIds.includes(damage.id)) return;
@@ -275,19 +238,83 @@ async function handle(req, res) {
       damage.status = "repaired";
       damage.afterPhotoUrl = result.afterPhotoUrl || body.defaultAfterPhotoUrl || damage.afterPhotoUrl;
       damage.repairNote = result.repairNote || body.defaultRepairNote || damage.repairNote;
-      damage.repairedAt = new Date().toISOString();
+      damage.repairedAt = now();
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
+  }
+
+  // ===== 数字化送扫 / 完整性校验 / 调阅冻结 =====
+
+  if (req.method === "GET" && pathname === "/scan-batches") {
+    const rubbingId = url.searchParams.get("rubbingId");
+    return send(res, 200, { data: scanBatches.listBatches(db, { rubbingId }) });
+  }
+
+  const scanBatchMatch = pathname.match(/^\/scan-batches\/([^/]+)$/);
+  if (scanBatchMatch && req.method === "GET") {
+    const batch = scanBatches.getBatch(db, scanBatchMatch[1]);
+    return send(res, 200, { data: scanBatches.serialize(db, batch) });
+  }
+
+  const verifyMatch = pathname.match(/^\/scan-batches\/([^/]+)\/verify$/);
+  if (verifyMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const { batch, result } = scanBatches.verify(db, verifyMatch[1], body);
+    await writeDb(db);
+    if (!result.ok) {
+      return send(res, 200, {
+        data: scanBatches.serialize(db, batch),
+        verification: { passed: false, anomalies: result.anomalies }
+      });
+    }
+    return send(res, 200, {
+      data: scanBatches.serialize(db, batch),
+      verification: { passed: true, anomalies: [] }
+    });
+  }
+
+  const rescanMatch = pathname.match(/^\/scan-batches\/([^/]+)\/rescan$/);
+  if (rescanMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const { batch } = scanBatches.rescan(db, rescanMatch[1], body);
+    await writeDb(db);
+    return send(res, 200, {
+      data: scanBatches.serialize(db, batch),
+      verification: { passed: true, newVersion: batch.currentVersion, anomalies: [] }
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/accesses") {
+    const body = await parseBody(req);
+    const record = accessControl.access(db, body); // 隔离/未就绪时抛 409，前面的记录不会落库
+    await writeDb(db);
+    const batch = scanBatches.getBatch(db, record.scanBatchId);
+    return send(res, 201, {
+      data: record,
+      scanBatch: { id: batch.id, status: batch.status, version: record.version }
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/accesses") {
+    const rubbingId = url.searchParams.get("rubbingId");
+    const scanBatchId = url.searchParams.get("scanBatchId");
+    return send(res, 200, { data: accessControl.listAccessRecords(db, { rubbingId, scanBatchId }) });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) => {
+    const body = { error: error.message || "服务器错误" };
+    if (error.code) body.code = error.code;
+    if (error.anomalies) body.anomalies = error.anomalies;
+    send(res, error.status || 500, body);
+  });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+  await migrateLegacyData(); // 旧拓片按未归档处理并写回数据文件
   console.log(`Rubbing repair API running at http://127.0.0.1:${PORT}`);
 });
