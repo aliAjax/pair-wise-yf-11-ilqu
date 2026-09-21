@@ -1,53 +1,16 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+
+const { readDb, writeDb } = require("./lib/db");
+const { createError } = require("./lib/utils");
+const rubbings = require("./modules/rubbings");
+const scanBatches = require("./modules/scanBatches");
+const integrity = require("./modules/integrity");
+const access = require("./modules/access");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  rubbings: [
-    {
-      id: "rubbing_demo",
-      code: "TP-清-014",
-      source: "地方碑刻残页",
-      paperSize: "42x68cm",
-      note: "边缘有旧折痕",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  damages: [
-    {
-      id: "damage_demo_1",
-      rubbingId: "rubbing_demo",
-      position: "左上角第3列题字旁",
-      type: "虫蛀孔",
-      beforePhotoUrl: "https://example.local/before-014-1.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    },
-    {
-      id: "damage_demo_2",
-      rubbingId: "rubbing_demo",
-      position: "下边缘中央",
-      type: "撕裂",
-      beforePhotoUrl: "https://example.local/before-014-2.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    }
-  ],
-  batches: []
-};
 
 const routes = [
+  // 修补闭环
   "GET /health",
   "GET /rubbings",
   "POST /rubbings",
@@ -58,26 +21,23 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  // 拓片生命周期：结项 / 资料确认 / 归档
+  "POST /rubbings/:id/close",
+  "POST /rubbings/:id/materials",
+  "POST /rubbings/:id/archive",
+  // 扫描批次模块
+  "GET /rubbings/:id/scan-batches",
+  "POST /rubbings/:id/scan-batches",
+  "GET /scan-batches/:id",
+  "POST /scan-batches/:id/files",
+  // 完整性校验模块
+  "POST /scan-batches/:id/verify",
+  "POST /scan-batches/:id/rescan",
+  // 调阅冻结模块
+  "POST /rubbings/:id/access",
+  "GET /access-records?rubbingId=&batchId="
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -91,33 +51,19 @@ async function parseBody(req) {
   try {
     return JSON.parse(raw);
   } catch {
-    const error = new Error("请求体必须是合法JSON");
-    error.status = 400;
-    throw error;
+    throw createError(400, "请求体必须是合法JSON");
   }
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function required(body, fields) {
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
   if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
-    error.status = 400;
-    throw error;
+    throw createError(400, `缺少字段：${missing.join(", ")}`);
   }
 }
 
-function findRubbing(db, rubbingId) {
-  const rubbing = db.rubbings.find((item) => item.id === rubbingId);
-  if (!rubbing) {
-    const error = new Error("拓片不存在");
-    error.status = 404;
-    throw error;
-  }
-  return rubbing;
+function makeId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function enrichBatch(db, batch) {
@@ -131,6 +77,22 @@ function enrichBatch(db, batch) {
   };
 }
 
+function enrichRubbing(db, rubbing) {
+  const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
+  const scanList = scanBatches.listByRubbing(db, rubbing.id);
+  const latest = scanList.length ? scanList[scanList.length - 1] : null;
+  return {
+    ...rubbing,
+    damageCount: damages.length,
+    pendingDamages: damages.filter((item) => item.status !== "repaired").length,
+    scanBatchCount: scanList.length,
+    latestScanVersion: latest ? latest.version : null,
+    latestScanStatus: latest ? latest.status : null,
+    // 最新批次隔离 => 调阅冻结
+    accessFrozen: latest ? latest.status === scanBatches.STATUS.QUARANTINED : false
+  };
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
@@ -141,15 +103,7 @@ async function handle(req, res) {
   }
 
   if (req.method === "GET" && pathname === "/rubbings") {
-    const data = db.rubbings.map((rubbing) => {
-      const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
-      return {
-        ...rubbing,
-        damageCount: damages.length,
-        pendingDamages: damages.filter((item) => item.status !== "repaired").length
-      };
-    });
-    return send(res, 200, { data });
+    return send(res, 200, { data: db.rubbings.map((rubbing) => enrichRubbing(db, rubbing)) });
   }
 
   if (req.method === "POST" && pathname === "/rubbings") {
@@ -161,23 +115,26 @@ async function handle(req, res) {
       source: body.source,
       paperSize: body.paperSize,
       note: body.note || "",
+      projectStatus: "open",
+      materialsComplete: false,
+      archived: false,
       createdAt: new Date().toISOString()
     };
     db.rubbings.push(rubbing);
     await writeDb(db);
-    return send(res, 201, { data: rubbing });
+    return send(res, 201, { data: enrichRubbing(db, rubbing) });
   }
 
   const rubbingDamagesMatch = pathname.match(/^\/rubbings\/([^/]+)\/damages$/);
   if (rubbingDamagesMatch && req.method === "GET") {
     const rubbingId = rubbingDamagesMatch[1];
-    findRubbing(db, rubbingId);
+    rubbings.getById(db, rubbingId);
     return send(res, 200, { data: db.damages.filter((item) => item.rubbingId === rubbingId) });
   }
 
   if (rubbingDamagesMatch && req.method === "POST") {
     const rubbingId = rubbingDamagesMatch[1];
-    findRubbing(db, rubbingId);
+    rubbings.getById(db, rubbingId);
     const body = await parseBody(req);
     required(body, ["position", "type", "beforePhotoUrl"]);
     const damage = {
@@ -230,7 +187,9 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/batches") {
     const body = await parseBody(req);
     required(body, ["name", "damageIds"]);
-    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) return send(res, 400, { error: "damageIds必须是非空数组" });
+    if (!Array.isArray(body.damageIds) || body.damageIds.length === 0) {
+      return send(res, 400, { error: "damageIds必须是非空数组" });
+    }
     const invalid = body.damageIds.filter((id) => !db.damages.find((damage) => damage.id === id));
     if (invalid.length) return send(res, 400, { error: `缺损项不存在：${invalid.join(", ")}` });
     const batch = {
@@ -279,6 +238,137 @@ async function handle(req, res) {
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
+  }
+
+  // ===== 拓片生命周期：结项 / 资料确认 / 归档 =====
+
+  const closeMatch = pathname.match(/^\/rubbings\/([^/]+)\/close$/);
+  if (closeMatch && req.method === "POST") {
+    const rubbing = rubbings.closeProject(db, closeMatch[1]);
+    await writeDb(db);
+    return send(res, 200, { data: enrichRubbing(db, rubbing) });
+  }
+
+  const materialsMatch = pathname.match(/^\/rubbings\/([^/]+)\/materials$/);
+  if (materialsMatch && req.method === "POST") {
+    const rubbing = rubbings.confirmMaterials(db, materialsMatch[1]);
+    await writeDb(db);
+    return send(res, 200, { data: enrichRubbing(db, rubbing) });
+  }
+
+  const archiveMatch = pathname.match(/^\/rubbings\/([^/]+)\/archive$/);
+  if (archiveMatch && req.method === "POST") {
+    const rubbing = rubbings.archive(db, archiveMatch[1]);
+    await writeDb(db);
+    return send(res, 200, { data: enrichRubbing(db, rubbing) });
+  }
+
+  // ===== 扫描批次模块 =====
+
+  const scanListMatch = pathname.match(/^\/rubbings\/([^/]+)\/scan-batches$/);
+  if (scanListMatch && req.method === "GET") {
+    const rubbingId = scanListMatch[1];
+    rubbings.getById(db, rubbingId);
+    const data = scanBatches.listByRubbing(db, rubbingId).map((batch) => scanBatches.enrich(db, batch));
+    return send(res, 200, { data });
+  }
+
+  if (scanListMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    // 仅已结项且资料齐全可送扫；未完成扫描重复送扫抛 409，原批次与状态不变（此处尚未写库）
+    const batch = scanBatches.submitForScan(db, scanListMatch[1], body);
+    await writeDb(db);
+    return send(res, 201, { data: scanBatches.enrich(db, batch) });
+  }
+
+  const scanBatchMatch = pathname.match(/^\/scan-batches\/([^/]+)$/);
+  if (scanBatchMatch && req.method === "GET") {
+    const batch = scanBatches.getById(db, scanBatchMatch[1]);
+    return send(res, 200, { data: scanBatches.enrich(db, batch) });
+  }
+
+  const filesMatch = pathname.match(/^\/scan-batches\/([^/]+)\/files$/);
+  if (filesMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    const files = integrity.normalizeFiles(body.files);
+    const batch = scanBatches.uploadFiles(db, filesMatch[1], files);
+    await writeDb(db);
+    return send(res, 200, { data: scanBatches.enrich(db, batch) });
+  }
+
+  // ===== 完整性校验模块 =====
+
+  const verifyMatch = pathname.match(/^\/scan-batches\/([^/]+)\/verify$/);
+  if (verifyMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["expectedFiles"]);
+    const result = integrity.verify(db, verifyMatch[1], body.expectedFiles);
+    await writeDb(db);
+    if (!result.passed) {
+      // HTTP 仍为 200：校验和异常是业务结果，批次已整批隔离；具体状态看 body
+      return send(res, 200, {
+        passed: false,
+        data: scanBatches.enrich(db, result.batch),
+        mismatches: result.mismatches
+      });
+    }
+    return send(res, 200, {
+      passed: true,
+      data: scanBatches.enrich(db, result.newBatch || result.batch),
+      previousVersion: result.newBatch ? scanBatches.enrich(db, result.batch) : null
+    });
+  }
+
+  const rescanMatch = pathname.match(/^\/scan-batches\/([^/]+)\/rescan$/);
+  if (rescanMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    required(body, ["files"]);
+    const result = integrity.rescan(db, rescanMatch[1], body);
+    await writeDb(db);
+    if (result.passed === false) {
+      // 补扫仍不一致：继续隔离
+      return send(res, 200, {
+        passed: false,
+        data: scanBatches.enrich(db, result.batch),
+        mismatches: result.mismatches
+      });
+    }
+    if (result.newBatch) {
+      // 补扫一致：新版本可用，旧版本只读
+      return send(res, 201, {
+        passed: true,
+        data: scanBatches.enrich(db, result.newBatch),
+        previousVersion: scanBatches.enrich(db, result.batch)
+      });
+    }
+    return send(res, 200, {
+      quarantined: true,
+      message: "补扫文件已接收，等待完整性校验",
+      data: scanBatches.enrich(db, result.batch)
+    });
+  }
+
+  // ===== 调阅冻结模块 =====
+
+  const accessMatch = pathname.match(/^\/rubbings\/([^/]+)\/access$/);
+  if (accessMatch && req.method === "POST") {
+    const body = await parseBody(req);
+    // 隔离/无可用版本时抛 409，requestAccess 在检查通过后才写访问记录
+    const result = access.requestAccess(db, accessMatch[1], body);
+    await writeDb(db);
+    return send(res, 201, {
+      data: {
+        record: result.record,
+        batch: scanBatches.enrich(db, result.batch),
+        rubbingCode: result.rubbingCode
+      }
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/access-records") {
+    const rubbingId = url.searchParams.get("rubbingId");
+    const batchId = url.searchParams.get("batchId");
+    return send(res, 200, { data: access.listRecords(db, { rubbingId, batchId }) });
   }
 
   return send(res, 404, { error: "接口不存在", routes });

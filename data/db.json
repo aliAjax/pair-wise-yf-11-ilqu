@@ -6,6 +6,9 @@
       "source": "地方碑刻残页",
       "paperSize": "42x68cm",
       "note": "边缘有旧折痕",
+      "projectStatus": "open",
+      "materialsComplete": false,
+      "archived": false,
       "createdAt": "2026-06-16T00:00:00.000Z"
     }
   ],
@@ -37,5 +40,7 @@
       "repairedAt": null
     }
   ],
-  "batches": []
+  "batches": [],
+  "scanBatches": [],
+  "accessRecords": []
 }
